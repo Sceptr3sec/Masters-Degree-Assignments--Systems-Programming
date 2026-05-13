@@ -11,31 +11,101 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <ctime>
+#include <vector>
+#include <mutex>
+#include <functional>
+#include <queue>
+#include <condition_variable>
+#include <thread>
 
-std::string resolvePath(const std::string &root, const std::string &cwd, const std::string &path) {
-    std::string combined;
-    if (!path.empty() && path[0] == '/') {
-        combined = root + path;
-    } else {
-        combined = root + cwd + "/" + path;
+// -------------------------------------------------------
+// Thread Pool
+// -------------------------------------------------------
+class ThreadPool {
+public:
+    ThreadPool(int numThreads) : shutdown(false) {
+        for (int i = 0; i < numThreads; i++) {
+            workers.emplace_back([this]() {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        cv.wait(lock, [this]() {
+                            return !tasks.empty() || shutdown;
+                        });
+                        if (shutdown && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
     }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            shutdown = true;
+        }
+        cv.notify_all();
+        for (auto &t : workers) t.join();
+    }
+
+    void submit(std::function<void()> task) {
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            tasks.push(std::move(task));
+        }
+        cv.notify_one();
+    }
+
+private:
+    std::vector<std::thread>          workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex                        mtx;
+    std::condition_variable           cv;
+    bool                              shutdown;
+};
+
+// -------------------------------------------------------
+// Path resolution
+// -------------------------------------------------------
+std::string resolvePath(const std::string &root,
+                        const std::string &cwd,
+                        const std::string &path)
+{
+    std::string combined;
+    if (!path.empty() && path[0] == '/')
+        combined = root + path;
+    else
+        combined = root + cwd + "/" + path;
+
     char resolved[PATH_MAX];
     if (realpath(combined.c_str(), resolved) == nullptr) return "";
+
     std::string resolvedStr(resolved);
     if (resolvedStr.find(root) != 0) return "";
     return resolvedStr;
 }
 
-//Opens data connection in either active or passive mode, returns data socket fd or -1 on error
-int openDataConnection(bool isPasv, int &pasvFd, bool isPort, sockaddr_in &portaddr) {
-    if(isPasv && pasvFd >= 0) {
+// -------------------------------------------------------
+// Data channel
+// -------------------------------------------------------
+int openDataConnection(bool isPasv, int &pasvFd,
+                       bool isPort, sockaddr_in &portAddr)
+{
+    if (isPasv && pasvFd >= 0) {
         int dataFd = accept(pasvFd, nullptr, nullptr);
-        close(pasvFd); pasvFd = -1;
+        close(pasvFd);
+        pasvFd = -1;
         return dataFd;
-    } else if(isPort) {
+    } else if (isPort) {
         int dataFd = socket(AF_INET, SOCK_STREAM, 0);
-        if(dataFd < 0) return -1;
-        if(connect(dataFd, reinterpret_cast<sockaddr*>(&portaddr), sizeof(portaddr)) < 0) {
+        if (dataFd < 0) return -1;
+        if (connect(dataFd,
+                    reinterpret_cast<sockaddr*>(&portAddr),
+                    sizeof(portAddr)) < 0) {
             close(dataFd);
             return -1;
         }
@@ -44,47 +114,19 @@ int openDataConnection(bool isPasv, int &pasvFd, bool isPort, sockaddr_in &porta
     return -1;
 }
 
-int main(int argc, char **argv) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <port> <root_directory>\n";
-        return 1;
-    }
-
-    int port = std::stoi(argv[1]);
-    std::string rootDir = argv[2];
-    std::string cwd = "/";
-    int pasvFd = -1;
-    bool isPasv = false;
+// -------------------------------------------------------
+// Per-client session — runs in a worker thread
+// -------------------------------------------------------
+void handleClient(int clientFd, std::string rootDir)
+{
+    // Per-session state
+    std::string cwd   = "/";
+    int         pasvFd = -1;
+    bool        isPasv = false;
     sockaddr_in portAddr{};
-    bool isPort = false;
+    bool        isPort = false;
 
-    int serverFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverFd < 0) { perror("socket"); return 1; }
-
-    int opt = 1;
-    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
-
-    if (bind(serverFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        perror("bind"); return 1;
-    }
-
-    listen(serverFd, 5);
-    std::cout << "FTP Server running on port " << port << "\n";
-    std::cout << "Root directory: " << rootDir << "\n";
-
-    sockaddr_in clientAddr{};
-    socklen_t clientAddrLen = sizeof(clientAddr);
-    int clientFd = accept(serverFd, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
-
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &clientAddr.sin_addr, ip, sizeof(ip));
-    std::cout << "Client connected: " << ip << "\n";
-
+    // Greet the client
     std::string greeting = "220 Welcome to Simple FTP Server\r\n";
     write(clientFd, greeting.c_str(), greeting.size());
 
@@ -96,15 +138,20 @@ int main(int argc, char **argv) {
         if (n <= 0) { std::cout << "Client disconnected.\n"; break; }
 
         if (c == '\n') {
+            // Strip \r and uppercase the command word
             if (!line.empty() && line.back() == '\r') line.pop_back();
-
             size_t spacePos = line.find(' ');
             std::string cmd = line.substr(0, spacePos);
             for (char &ch : cmd) ch = toupper(ch);
-            line = (spacePos != std::string::npos) ? cmd + line.substr(spacePos) : cmd;
+            line = (spacePos != std::string::npos)
+                   ? cmd + line.substr(spacePos)
+                   : cmd;
 
             std::cout << "Received: " << line << "\n";
 
+            // ------------------------------------------
+            // AUTH
+            // ------------------------------------------
             if (line.substr(0, 4) == "USER") {
                 std::string reply = "331 Username OK, need password\r\n";
                 write(clientFd, reply.c_str(), reply.size());
@@ -118,12 +165,15 @@ int main(int argc, char **argv) {
                 write(clientFd, reply.c_str(), reply.size());
                 break;
 
+            // ------------------------------------------
+            // NAVIGATION
+            // ------------------------------------------
             } else if (line == "PWD" || line == "XPWD") {
                 std::string reply = "257 \"" + cwd + "\" is the current directory\r\n";
                 write(clientFd, reply.c_str(), reply.size());
 
             } else if (line.substr(0, 3) == "CWD") {
-                std::string path = line.substr(4);
+                std::string path    = line.substr(4);
                 std::string newPath = resolvePath(rootDir, cwd, path);
                 if (!newPath.empty()) {
                     cwd = newPath.substr(rootDir.size());
@@ -137,52 +187,96 @@ int main(int argc, char **argv) {
 
             } else if (line == "CDUP") {
                 size_t lastSlash = cwd.rfind('/');
-                if (lastSlash == 0 || lastSlash == std::string::npos) {
+                if (lastSlash == 0 || lastSlash == std::string::npos)
                     cwd = "/";
-                } else {
+                else
                     cwd = cwd.substr(0, lastSlash);
-                }
                 std::string reply = "250 Directory changed to " + cwd + "\r\n";
                 write(clientFd, reply.c_str(), reply.size());
 
+            // ------------------------------------------
+            // PASSIVE MODE
+            // ------------------------------------------
             } else if (line == "PASV") {
-                if (pasvFd != -1) { close(pasvFd); pasvFd = -1; }
+                if (pasvFd >= 0) { close(pasvFd); pasvFd = -1; }
 
                 pasvFd = socket(AF_INET, SOCK_STREAM, 0);
-                if (pasvFd < 0) { perror("socket"); return 1; }
+                if (pasvFd < 0) { perror("socket"); return; }
+
                 int o = 1;
                 setsockopt(pasvFd, SOL_SOCKET, SO_REUSEADDR, &o, sizeof(o));
 
                 sockaddr_in pasvAddr{};
                 pasvAddr.sin_family      = AF_INET;
                 pasvAddr.sin_addr.s_addr = INADDR_ANY;
-                pasvAddr.sin_port        = htons(0);
+                pasvAddr.sin_port        = htons(0); // bind(0) — OS picks port
 
-                if (bind(pasvFd, reinterpret_cast<sockaddr*>(&pasvAddr), sizeof(pasvAddr)) < 0) {
-                    perror("bind"); return 1;
+                if (bind(pasvFd,
+                         reinterpret_cast<sockaddr*>(&pasvAddr),
+                         sizeof(pasvAddr)) < 0) {
+                    perror("bind"); return;
                 }
 
                 sockaddr_in assigned{};
-                socklen_t assignedLen = sizeof(assigned);
-                getsockname(pasvFd, reinterpret_cast<sockaddr*>(&assigned), &assignedLen);
+                socklen_t   assignedLen = sizeof(assigned);
+                getsockname(pasvFd,
+                            reinterpret_cast<sockaddr*>(&assigned),
+                            &assignedLen);
                 listen(pasvFd, 1);
 
                 int pasvPort = ntohs(assigned.sin_port);
+
                 sockaddr_in localAddr{};
-                socklen_t localLen = sizeof(localAddr);
-                getsockname(clientFd, reinterpret_cast<sockaddr*>(&localAddr), &localLen);
-                unsigned char *ip4 = reinterpret_cast<unsigned char*>(&localAddr.sin_addr.s_addr);
+                socklen_t   localLen = sizeof(localAddr);
+                getsockname(clientFd,
+                            reinterpret_cast<sockaddr*>(&localAddr),
+                            &localLen);
+                unsigned char *ip4 = reinterpret_cast<unsigned char*>(
+                                         &localAddr.sin_addr.s_addr);
 
                 char reply[128];
                 snprintf(reply, sizeof(reply),
                     "227 Entering Passive Mode (%u,%u,%u,%u,%d,%d)\r\n",
-                    ip4[0], ip4[1], ip4[2], ip4[3], pasvPort / 256, pasvPort % 256);
+                    ip4[0], ip4[1], ip4[2], ip4[3],
+                    pasvPort / 256, pasvPort % 256);
                 write(clientFd, reply, strlen(reply));
                 isPasv = true;
+                isPort = false;
 
+            // ------------------------------------------
+            // ACTIVE MODE
+            // ------------------------------------------
+            } else if (line.substr(0, 4) == "PORT") {
+                std::string  arg = line.substr(5);
+                unsigned int h1, h2, h3, h4, p1, p2;
+
+                if (sscanf(arg.c_str(), "%u,%u,%u,%u,%u,%u",
+                           &h1, &h2, &h3, &h4, &p1, &p2) != 6) {
+                    std::string reply = "501 Syntax error in parameters\r\n";
+                    write(clientFd, reply.c_str(), reply.size());
+                } else {
+                    char ipStr[16];
+                    snprintf(ipStr, sizeof(ipStr),
+                             "%u.%u.%u.%u", h1, h2, h3, h4);
+                    portAddr = {};
+                    portAddr.sin_family = AF_INET;
+                    portAddr.sin_port   = htons(p1 * 256 + p2);
+                    inet_pton(AF_INET, ipStr, &portAddr.sin_addr);
+
+                    if (pasvFd >= 0) { close(pasvFd); pasvFd = -1; }
+                    isPasv = false;
+                    isPort = true;
+
+                    std::string reply = "200 PORT command successful\r\n";
+                    write(clientFd, reply.c_str(), reply.size());
+                }
+
+            // ------------------------------------------
+            // LIST
+            // ------------------------------------------
             } else if (line == "LIST" || line.substr(0, 5) == "LIST ") {
                 if ((!isPasv || pasvFd < 0) && !isPort) {
-                    std::string reply = "425 Use PASV first\r\n";
+                    std::string reply = "425 Use PORT or PASV first\r\n";
                     write(clientFd, reply.c_str(), reply.size());
                 } else {
                     std::string reply150 = "150 Here comes the directory listing\r\n";
@@ -200,21 +294,22 @@ int main(int argc, char **argv) {
                             while ((entry = readdir(dir)) != nullptr) {
                                 std::string name = entry->d_name;
                                 if (name == "." || name == "..") continue;
+
                                 std::string entryPath = dirPath + "/" + name;
                                 struct stat st{};
                                 if (stat(entryPath.c_str(), &st) != 0) continue;
 
                                 char perms[11];
-                                perms[0]  = S_ISDIR(st.st_mode) ? 'd' : '-';
-                                perms[1]  = (st.st_mode & S_IRUSR) ? 'r' : '-';
-                                perms[2]  = (st.st_mode & S_IWUSR) ? 'w' : '-';
-                                perms[3]  = (st.st_mode & S_IXUSR) ? 'x' : '-';
-                                perms[4]  = (st.st_mode & S_IRGRP) ? 'r' : '-';
-                                perms[5]  = (st.st_mode & S_IWGRP) ? 'w' : '-';
-                                perms[6]  = (st.st_mode & S_IXGRP) ? 'x' : '-';
-                                perms[7]  = (st.st_mode & S_IROTH) ? 'r' : '-';
-                                perms[8]  = (st.st_mode & S_IWOTH) ? 'w' : '-';
-                                perms[9]  = (st.st_mode & S_IXOTH) ? 'x' : '-';
+                                perms[0]  = S_ISDIR(st.st_mode)      ? 'd' : '-';
+                                perms[1]  = (st.st_mode & S_IRUSR)   ? 'r' : '-';
+                                perms[2]  = (st.st_mode & S_IWUSR)   ? 'w' : '-';
+                                perms[3]  = (st.st_mode & S_IXUSR)   ? 'x' : '-';
+                                perms[4]  = (st.st_mode & S_IRGRP)   ? 'r' : '-';
+                                perms[5]  = (st.st_mode & S_IWGRP)   ? 'w' : '-';
+                                perms[6]  = (st.st_mode & S_IXGRP)   ? 'x' : '-';
+                                perms[7]  = (st.st_mode & S_IROTH)   ? 'r' : '-';
+                                perms[8]  = (st.st_mode & S_IWOTH)   ? 'w' : '-';
+                                perms[9]  = (st.st_mode & S_IXOTH)   ? 'x' : '-';
                                 perms[10] = '\0';
 
                                 char timebuf[16];
@@ -224,8 +319,11 @@ int main(int argc, char **argv) {
                                 char fileline[512];
                                 snprintf(fileline, sizeof(fileline),
                                     "%s %3lu ftp ftp %8lu %s %s\r\n",
-                                    perms, (unsigned long)st.st_nlink,
-                                    (unsigned long)st.st_size, timebuf, name.c_str());
+                                    perms,
+                                    (unsigned long)st.st_nlink,
+                                    (unsigned long)st.st_size,
+                                    timebuf,
+                                    name.c_str());
                                 write(dataFd, fileline, strlen(fileline));
                             }
                             closedir(dir);
@@ -236,33 +334,38 @@ int main(int argc, char **argv) {
                     write(clientFd, reply226.c_str(), reply226.size());
                 }
 
+            // ------------------------------------------
+            // RETR (download)
+            // ------------------------------------------
             } else if (line.substr(0, 4) == "RETR") {
                 if ((!isPasv || pasvFd < 0) && !isPort) {
-                    std::string reply = "425 Use PASV first\r\n";
+                    std::string reply = "425 Use PORT or PASV first\r\n";
                     write(clientFd, reply.c_str(), reply.size());
                 } else {
                     std::string filename = line.substr(5);
                     std::string filePath = resolvePath(rootDir, cwd, filename);
+
                     if (filePath.empty()) {
                         std::string reply = "550 File not found\r\n";
                         write(clientFd, reply.c_str(), reply.size());
-                        close(pasvFd); pasvFd = -1; isPasv = false;
+                        if (pasvFd >= 0) { close(pasvFd); pasvFd = -1; }
+                        isPasv = false; isPort = false;
                     } else {
                         FILE *file = fopen(filePath.c_str(), "rb");
                         if (!file) {
                             std::string reply = "550 Cannot open file\r\n";
                             write(clientFd, reply.c_str(), reply.size());
-                            close(pasvFd); pasvFd = -1; isPasv = false;
+                            if (pasvFd >= 0) { close(pasvFd); pasvFd = -1; }
+                            isPasv = false; isPort = false;
                         } else {
                             std::string reply150 = "150 Opening data connection\r\n";
                             write(clientFd, reply150.c_str(), reply150.size());
 
                             int dataFd = openDataConnection(isPasv, pasvFd, isPort, portAddr);
-                            isPasv = false;
-                            isPort = false;
+                            isPasv = false; isPort = false;
 
                             if (dataFd >= 0) {
-                                char buffer[65536];
+                                char   buffer[65536];
                                 size_t bytesRead;
                                 while ((bytesRead = fread(buffer, 1, sizeof(buffer), file)) > 0) {
                                     ssize_t sent = 0;
@@ -281,14 +384,17 @@ int main(int argc, char **argv) {
                     }
                 }
 
+            // ------------------------------------------
+            // STOR (upload)
+            // ------------------------------------------
             } else if (line.substr(0, 4) == "STOR") {
                 if ((!isPasv || pasvFd < 0) && !isPort) {
-                    std::string reply = "425 Use PASV first\r\n";
+                    std::string reply = "425 Use PORT or PASV first\r\n";
                     write(clientFd, reply.c_str(), reply.size());
                 } else {
                     std::string filename = line.substr(5);
                     std::string fullPath;
-                    bool pathOk = true;
+                    bool        pathOk = true;
 
                     size_t lastSlash = filename.rfind('/');
                     if (lastSlash != std::string::npos) {
@@ -298,7 +404,8 @@ int main(int argc, char **argv) {
                         if (resolvedDir.empty()) {
                             std::string reply = "553 Directory not found\r\n";
                             write(clientFd, reply.c_str(), reply.size());
-                            close(pasvFd); pasvFd = -1; isPasv = false;
+                            if (pasvFd >= 0) { close(pasvFd); pasvFd = -1; }
+                            isPasv = false; isPort = false;
                             pathOk = false;
                         } else {
                             fullPath = resolvedDir + "/" + name;
@@ -308,7 +415,8 @@ int main(int argc, char **argv) {
                         if (resolvedDir.empty()) {
                             std::string reply = "553 Cannot resolve directory\r\n";
                             write(clientFd, reply.c_str(), reply.size());
-                            close(pasvFd); pasvFd = -1; isPasv = false;
+                            if (pasvFd >= 0) { close(pasvFd); pasvFd = -1; }
+                            isPasv = false; isPort = false;
                             pathOk = false;
                         } else {
                             fullPath = resolvedDir + "/" + filename;
@@ -320,21 +428,20 @@ int main(int argc, char **argv) {
                         if (!file) {
                             std::string reply = "553 Cannot create file\r\n";
                             write(clientFd, reply.c_str(), reply.size());
-                            close(pasvFd); pasvFd = -1; isPasv = false;
+                            if (pasvFd >= 0) { close(pasvFd); pasvFd = -1; }
+                            isPasv = false; isPort = false;
                         } else {
                             std::string reply150 = "150 Opening data connection\r\n";
                             write(clientFd, reply150.c_str(), reply150.size());
 
                             int dataFd = openDataConnection(isPasv, pasvFd, isPort, portAddr);
-                            isPasv = false;
-                            isPort = false;
+                            isPasv = false; isPort = false;
 
                             if (dataFd >= 0) {
-                                char buffer[65536];
+                                char    buffer[65536];
                                 ssize_t bytesRead;
-                                while ((bytesRead = read(dataFd, buffer, sizeof(buffer))) > 0) {
+                                while ((bytesRead = read(dataFd, buffer, sizeof(buffer))) > 0)
                                     fwrite(buffer, 1, bytesRead, file);
-                                }
                                 close(dataFd);
                             }
                             fclose(file);
@@ -344,29 +451,9 @@ int main(int argc, char **argv) {
                     }
                 }
 
-            } else if (line.substr(0, 4) == "PORT") {
-                std::string arg = line.substr(5);
-
-                unsigned int h1, h2, h3, h4, p1, p2;
-                if(sscanf(arg.c_str(), "%u,%u,%u,%u,%u,%u", &h1, &h2, &h3, &h4, &p1, &p2) != 6) {
-                    std::string reply = "501 syntax error in parameters\r\n";
-                    write(clientFd, reply.c_str(), reply.size());
-                } else {
-                    //Build IP string
-                    char ipStr[16];
-                    snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", h1, h2, h3, h4);
-                    portAddr = {};
-                    portAddr.sin_family = AF_INET;
-                    portAddr.sin_port = htons(p1 * 256 + p2);
-                    inet_pton(AF_INET, ipStr, &portAddr.sin_addr);
-                // Cancen any pending passive mode
-                    if(pasvFd >= 0) {close(pasvFd); pasvFd = -1; isPasv = false;}
-                    isPasv = false;
-                    isPort = true;
-
-                    std::string reply = "200 PORT command successful\r\n";
-                    write(clientFd, reply.c_str(), reply.size());
-                }
+            // ------------------------------------------
+            // FALLBACK
+            // ------------------------------------------
             } else {
                 std::string reply = "500 Unknown command\r\n";
                 write(clientFd, reply.c_str(), reply.size());
@@ -378,8 +465,13 @@ int main(int argc, char **argv) {
         }
     }
 
-    sleep(3);
     close(clientFd);
-    close(serverFd);
-    return 0;
 }
+
+// -------------------------------------------------------
+// main — socket setup + accept loop
+// -------------------------------------------------------
+int main(int argc, char **argv)
+{
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <port> <root_direc
