@@ -26,6 +26,24 @@ std::string resolvePath(const std::string &root, const std::string &cwd, const s
     return resolvedStr;
 }
 
+//Opens data connection in either active or passive mode, returns data socket fd or -1 on error
+int openDataConnection(bool isPasv, int &pasvFd, bool isPort, sockaddr_in &portaddr) {
+    if(isPasv && pasvFd >= 0) {
+        int dataFd = accept(pasvFd, nullptr, nullptr);
+        close(pasvFd); pasvFd = -1;
+        return dataFd;
+    } else if(isPort) {
+        int dataFd = socket(AF_INET, SOCK_STREAM, 0);
+        if(dataFd < 0) return -1;
+        if(connect(dataFd, reinterpret_cast<sockaddr*>(&portaddr), sizeof(portaddr)) < 0) {
+            close(dataFd);
+            return -1;
+        }
+        return dataFd;
+    }
+    return -1;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         std::cerr << "Usage: " << argv[0] << " <port> <root_directory>\n";
@@ -37,6 +55,8 @@ int main(int argc, char **argv) {
     std::string cwd = "/";
     int pasvFd = -1;
     bool isPasv = false;
+    sockaddr_in portAddr{};
+    bool isPort = false;
 
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
     if (serverFd < 0) { perror("socket"); return 1; }
@@ -161,15 +181,16 @@ int main(int argc, char **argv) {
                 isPasv = true;
 
             } else if (line == "LIST" || line.substr(0, 5) == "LIST ") {
-                if (!isPasv || pasvFd < 0) {
+                if ((!isPasv || pasvFd < 0) && !isPort) {
                     std::string reply = "425 Use PASV first\r\n";
                     write(clientFd, reply.c_str(), reply.size());
                 } else {
                     std::string reply150 = "150 Here comes the directory listing\r\n";
                     write(clientFd, reply150.c_str(), reply150.size());
 
-                    int dataFd = accept(pasvFd, nullptr, nullptr);
-                    close(pasvFd); pasvFd = -1; isPasv = false;
+                    int dataFd = openDataConnection(isPasv, pasvFd, isPort, portAddr);
+                    isPasv = false;
+                    isPort = false;
 
                     if (dataFd >= 0) {
                         std::string dirPath = resolvePath(rootDir, cwd, "");
@@ -216,7 +237,7 @@ int main(int argc, char **argv) {
                 }
 
             } else if (line.substr(0, 4) == "RETR") {
-                if (!isPasv || pasvFd < 0) {
+                if ((!isPasv || pasvFd < 0) && !isPort) {
                     std::string reply = "425 Use PASV first\r\n";
                     write(clientFd, reply.c_str(), reply.size());
                 } else {
@@ -236,8 +257,9 @@ int main(int argc, char **argv) {
                             std::string reply150 = "150 Opening data connection\r\n";
                             write(clientFd, reply150.c_str(), reply150.size());
 
-                            int dataFd = accept(pasvFd, nullptr, nullptr);
-                            close(pasvFd); pasvFd = -1; isPasv = false;
+                            int dataFd = openDataConnection(isPasv, pasvFd, isPort, portAddr);
+                            isPasv = false;
+                            isPort = false;
 
                             if (dataFd >= 0) {
                                 char buffer[65536];
@@ -260,7 +282,7 @@ int main(int argc, char **argv) {
                 }
 
             } else if (line.substr(0, 4) == "STOR") {
-                if (!isPasv || pasvFd < 0) {
+                if ((!isPasv || pasvFd < 0) && !isPort) {
                     std::string reply = "425 Use PASV first\r\n";
                     write(clientFd, reply.c_str(), reply.size());
                 } else {
@@ -303,8 +325,9 @@ int main(int argc, char **argv) {
                             std::string reply150 = "150 Opening data connection\r\n";
                             write(clientFd, reply150.c_str(), reply150.size());
 
-                            int dataFd = accept(pasvFd, nullptr, nullptr);
-                            close(pasvFd); pasvFd = -1; isPasv = false;
+                            int dataFd = openDataConnection(isPasv, pasvFd, isPort, portAddr);
+                            isPasv = false;
+                            isPort = false;
 
                             if (dataFd >= 0) {
                                 char buffer[65536];
@@ -321,6 +344,29 @@ int main(int argc, char **argv) {
                     }
                 }
 
+            } else if (line.substr(0, 4) == "PORT") {
+                std::string arg = line.substr(5);
+
+                unsigned int h1, h2, h3, h4, p1, p2;
+                if(sscanf(arg.c_str(), "%u,%u,%u,%u,%u,%u", &h1, &h2, &h3, &h4, &p1, &p2) != 6) {
+                    std::string reply = "501 syntax error in parameters\r\n";
+                    write(clientFd, reply.c_str(), reply.size());
+                } else {
+                    //Build IP string
+                    char ipStr[16];
+                    snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", h1, h2, h3, h4);
+                    portAddr = {};
+                    portAddr.sin_family = AF_INET;
+                    portAddr.sin_port = htons(p1 * 256 + p2);
+                    inet_pton(AF_INET, ipStr, &portAddr.sin_addr);
+                // Cancen any pending passive mode
+                    if(pasvFd >= 0) {close(pasvFd); pasvFd = -1; isPasv = false;}
+                    isPasv = false;
+                    isPort = true;
+
+                    std::string reply = "200 PORT command successful\r\n";
+                    write(clientFd, reply.c_str(), reply.size());
+                }
             } else {
                 std::string reply = "500 Unknown command\r\n";
                 write(clientFd, reply.c_str(), reply.size());
