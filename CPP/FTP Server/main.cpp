@@ -474,4 +474,51 @@ void handleClient(int clientFd, std::string rootDir)
 int main(int argc, char **argv)
 {
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <port> <root_direc
+        std::cerr << "Usage: " << argv[0] << " <port> <root_directory>\n";
+        return 1;
+    }
+
+    int         port    = std::stoi(argv[1]);
+    std::string rootDir = argv[2];
+
+    int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd < 0) { perror("socket"); return 1; }
+
+    int opt = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
+
+    if (bind(serverFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        perror("bind"); return 1;
+    }
+
+    listen(serverFd, 10);
+    std::cout << "FTP Server running on port " << port << "\n";
+    std::cout << "Root directory: " << rootDir << "\n";
+
+    ThreadPool pool(8);
+
+    while (true) {
+        sockaddr_in clientAddr{};
+        socklen_t   clientAddrLen = sizeof(clientAddr);
+        int clientFd = accept(serverFd,
+                              reinterpret_cast<sockaddr*>(&clientAddr),
+                              &clientAddrLen);
+        if (clientFd < 0) { perror("accept"); continue; }
+
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, ip, sizeof(ip));
+        std::cout << "Client connected: " << ip << "\n";
+
+        pool.submit([clientFd, rootDir]() {
+            handleClient(clientFd, rootDir);
+        });
+    }
+
+    close(serverFd);
+    return 0;
+}
