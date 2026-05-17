@@ -12,3 +12,5 @@ This folder contains C assignment projects from Season 1 Arc 1. Each subfolder i
 ## Summary
 
 The projects demonstrate fundamental C programming concepts, including command-line tools, text processing, formatted output, and game logic. This is a compact collection of practical C exercises for the first arc of the course.
+
+<img width="1872" height="656" alt="image" src="https://github.com/user-attachments/assets/a4b4608e-321c-4138-b58b-585cf4dbbd1f" />
