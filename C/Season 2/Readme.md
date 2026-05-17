@@ -15,3 +15,5 @@ This folder contains C projects from Season 2 of the course. Each subfolder is a
 ## Summary
 
 These projects demonstrate more advanced C techniques, including manual memory allocation, shell command handling, assembly interfacing, and simple network or input utilities. The collection highlights practical low-level programming tasks from the second season of assignments.
+
+<img width="1872" height="677" alt="image" src="https://github.com/user-attachments/assets/43a2bd52-95c5-4f1f-99fa-a31a833719dc" />
