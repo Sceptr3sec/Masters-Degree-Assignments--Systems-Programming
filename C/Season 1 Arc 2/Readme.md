@@ -13,4 +13,4 @@ This folder contains C projects from the Season 1 Arc 2 assignment series. Each 
 
 These projects focus on low-level C programming, file operations, command parsing, and simple data structures. They demonstrate practical implementations of classic Unix-style tools and a blockchain concept in a compact assignment format.
 
-![alt text](image.png)
+<img width="1874" height="659" alt="image" src="https://github.com/user-attachments/assets/1071c773-c47a-4be0-be39-1c508801b8c5" />
