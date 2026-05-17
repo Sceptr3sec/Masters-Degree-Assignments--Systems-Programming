@@ -23,12 +23,6 @@ All code, reports, and exercises were written from scratch as part of a rigorous
 - Shell scripting and command-line tools
 - Custom data structures and algorithm implementation
 
-### Full Stack Web Development
-- Frontend: HTML, CSS, JavaScript, React
-- Backend: Node.js, Express, Python, Ruby
-- Databases: SQL, SQLite, PostgreSQL, MongoDB
-- API design (RESTful), authentication, and deployment
-
 ### Algorithms & Data Structures
 - Sorting, recursion, search algorithms
 - Trees, graphs, stacks, queues, linked lists
