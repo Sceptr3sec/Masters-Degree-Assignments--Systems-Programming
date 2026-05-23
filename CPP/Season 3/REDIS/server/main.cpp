@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <csignal>
 #include <cstring>
-#include <cctype>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -23,112 +22,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#include "connection.hpp"
+#include "resp.hpp"
+
 // =====================================================================
 // CONSTANTS
 // =====================================================================
 constexpr int DEFAULT_PORT = 6379;
-constexpr int BUFFER_SIZE  = 65536;        // 64KB read buffer
 const std::string DUMP_FILE = "dump.my_rdb";
-
-// =====================================================================
-// RESP VALUE TYPE
-// =====================================================================
-struct RespValue {
-    enum class Type { SimpleString, Error, Integer, BulkString, Array, Null };
-
-    Type type = Type::Null;
-    std::string str;
-    long long integer = 0;
-    std::vector<RespValue> array;
-
-    static RespValue simple(const std::string& s)  { RespValue v; v.type=Type::SimpleString; v.str=s; return v; }
-    static RespValue error(const std::string& s)   { RespValue v; v.type=Type::Error; v.str=s; return v; }
-    static RespValue integer_val(long long i)       { RespValue v; v.type=Type::Integer; v.integer=i; return v; }
-    static RespValue bulk(const std::string& s)     { RespValue v; v.type=Type::BulkString; v.str=s; return v; }
-    static RespValue null_val()                     { RespValue v; v.type=Type::Null; return v; }
-    static RespValue array_val(std::vector<RespValue> a) { RespValue v; v.type=Type::Array; v.array=std::move(a); return v; }
-};
-
-// =====================================================================
-// RESP SERIALIZER
-// =====================================================================
-std::string serialize(const RespValue& val) {
-    switch (val.type) {
-        case RespValue::Type::SimpleString: return "+" + val.str + "\r\n";
-        case RespValue::Type::Error:        return "-" + val.str + "\r\n";
-        case RespValue::Type::Integer:      return ":" + std::to_string(val.integer) + "\r\n";
-        case RespValue::Type::BulkString:   return "$" + std::to_string(val.str.size()) + "\r\n" + val.str + "\r\n";
-        case RespValue::Type::Null:         return "$-1\r\n";
-        case RespValue::Type::Array: {
-            std::string out = "*" + std::to_string(val.array.size()) + "\r\n";
-            for (const auto& e : val.array) out += serialize(e);
-            return out;
-        }
-    }
-    return "-ERR internal\r\n";
-}
-
-// =====================================================================
-// RESP PARSER
-// =====================================================================
-static std::string readLine(const std::string& buf, size_t& pos) {
-    size_t start = pos;
-    while (pos + 1 < buf.size()) {
-        if (buf[pos] == '\r' && buf[pos+1] == '\n') {
-            std::string line = buf.substr(start, pos - start);
-            pos += 2;
-            return line;
-        }
-        pos++;
-    }
-    throw std::runtime_error("Incomplete RESP data");
-}
-
-static std::optional<RespValue> parseResp(const std::string& buf, size_t& pos);
-
-static std::optional<RespValue> parseBulk(const std::string& buf, size_t& pos) {
-    long long len = std::stoll(readLine(buf, pos));
-    if (len == -1) return RespValue::null_val();
-    if ((long long)(buf.size() - pos) < len + 2) throw std::runtime_error("Incomplete bulk string");
-    std::string data = buf.substr(pos, len);
-    pos += len + 2;
-    return RespValue::bulk(data);
-}
-
-static std::optional<RespValue> parseArray(const std::string& buf, size_t& pos) {
-    long long count = std::stoll(readLine(buf, pos));
-    if (count == -1) return RespValue::null_val();
-    std::vector<RespValue> elems;
-    for (long long i = 0; i < count; i++) {
-        auto e = parseResp(buf, pos);
-        if (!e) throw std::runtime_error("Incomplete array element");
-        elems.push_back(std::move(*e));
-    }
-    return RespValue::array_val(std::move(elems));
-}
-
-static std::optional<RespValue> parseInline(const std::string& buf, size_t& pos) {
-    std::string line = readLine(buf, pos);
-    std::vector<RespValue> parts;
-    std::istringstream iss(line);
-    std::string tok;
-    while (iss >> tok) parts.push_back(RespValue::bulk(tok));
-    if (parts.empty()) return std::nullopt;
-    return RespValue::array_val(std::move(parts));
-}
-
-static std::optional<RespValue> parseResp(const std::string& buf, size_t& pos) {
-    if (pos >= buf.size()) return std::nullopt;
-    char t = buf[pos++];
-    switch (t) {
-        case '+': return RespValue::simple(readLine(buf, pos));
-        case '-': return RespValue::error(readLine(buf, pos));
-        case ':': return RespValue::integer_val(std::stoll(readLine(buf, pos)));
-        case '$': return parseBulk(buf, pos);
-        case '*': return parseArray(buf, pos);
-        default:  pos--; return parseInline(buf, pos);
-    }
-}
 
 // =====================================================================
 // DATA STORE
@@ -159,6 +60,10 @@ std::string toUpper(std::string s) {
     for (char& c : s) c = (char)toupper((unsigned char)c);
     return s;
 }
+
+extern std::atomic<bool> g_running;
+extern RedisDb g_db;
+extern std::mutex g_mu;
 
 // =====================================================================
 // BINARY I/O HELPERS
@@ -349,33 +254,21 @@ RespValue cmdRename(const std::vector<std::string>& a, RedisDb& db) {
 // --- Lists ---
 RespValue cmdLpush(const std::vector<std::string>& a, RedisDb& db) {
     if (a.size()<3) return RespValue::error("ERR wrong number of arguments");
-    auto& entry = db[a[1]];
-    if (!std::holds_alternative<RedisList>(entry.value)) {
-        if (db.count(a[1])>0 && !std::holds_alternative<RedisList>(entry.value))
-            return RespValue::error(WRONGTYPE_ERR);
-        entry.value = RedisList{};
+    auto* entry = getEntry(db, a[1]);
+    if (!entry) {
+        RedisEntry newEntry;
+        newEntry.value = RedisList{};
+        auto result = db.emplace(a[1], std::move(newEntry));
+        entry = &result.first->second;
+    } else if (!std::holds_alternative<RedisList>(entry->value)) {
+        return RespValue::error(WRONGTYPE_ERR);
     }
-    auto& list = std::get<RedisList>(entry.value);
-    for (size_t i=1; i<a.size()-1; i++) list.insert(list.begin(), a[i+1]);
-    // Wait — the spec inserts in order: LPUSH mylist 1 2 3 results in [3,2,1]
-    // Each value is pushed to the left one by one
-    // Let's correct: insert each value to front
+    auto& list = std::get<RedisList>(entry->value);
+    for (size_t i = 2; i < a.size(); i++) {
+        list.insert(list.begin(), a[i]);
+    }
     return RespValue::integer_val((long long)list.size());
 }
-
-// NOTE: The above LPUSH has a subtle bug — let's use the correct version:
-// We clear and redo for clarity in the real file. In your actual code, use this:
-/*
-RespValue cmdLpush(const std::vector<std::string>& a, RedisDb& db) {
-    if (a.size()<3) return RespValue::error("ERR wrong number of arguments");
-    auto& entry = db[a[1]];
-    if (!std::holds_alternative<RedisList>(entry.value)) entry.value = RedisList{};
-    auto& list = std::get<RedisList>(entry.value);
-    for (size_t i = 1; i < a.size(); i++)  // skip cmd name, push each value
-        list.insert(list.begin(), a[i]);    // each goes to front
-    return RespValue::integer_val((long long)list.size());
-}
-*/
 
 RespValue cmdRpush(const std::vector<std::string>& a, RedisDb& db) {
     if (a.size()<3) return RespValue::error("ERR wrong number of arguments");
@@ -601,56 +494,33 @@ RespValue executeCommand(const std::vector<std::string>& args, RedisDb& db) {
 // CLIENT HANDLER
 // =====================================================================
 void handleClient(int client_fd, RedisDb& db, std::mutex& mu) {
-    std::string buf;
-    char tmp[BUFFER_SIZE];
+    Connection conn(client_fd);
 
     while (true) {
-        ssize_t n = recv(client_fd, tmp, sizeof(tmp), 0);
-        if (n <= 0) {
-            // n==0: client disconnected. n<0: error.
-            break;
-        }
-        buf.append(tmp, n);
-
-        // Try to parse and handle all complete commands in the buffer
-        size_t pos = 0;
-        while (pos < buf.size()) {
-            size_t saved_pos = pos;
-            try {
-                auto resp = parseResp(buf, pos);
-                if (!resp) break;
-
-                // Extract command args
-                std::vector<std::string> args;
-                if (resp->type == RespValue::Type::Array) {
-                    for (auto& elem : resp->array) {
-                        if (elem.type == RespValue::Type::BulkString ||
-                            elem.type == RespValue::Type::SimpleString)
-                            args.push_back(elem.str);
-                    }
+        while (auto resp = conn.nextRequest()) {
+            std::vector<std::string> args;
+            if (resp->type == RespValue::Type::Array) {
+                for (auto& elem : resp->array) {
+                    if (elem.type == RespValue::Type::BulkString ||
+                        elem.type == RespValue::Type::SimpleString)
+                        args.push_back(elem.str);
                 }
+            }
 
-                // Execute (with lock)
-                RespValue result;
-                {
-                    std::lock_guard<std::mutex> lock(mu);
-                    result = executeCommand(args, db);
-                }
+            RespValue result;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                result = executeCommand(args, db);
+            }
 
-                // Send response
-                std::string reply = serialize(result);
-                send(client_fd, reply.data(), reply.size(), 0);
-
-            } catch (const std::runtime_error&) {
-                // Incomplete data — wait for more bytes
-                pos = saved_pos;
-                break;
+            if (!conn.sendResponse(result)) {
+                return;
             }
         }
-        // Keep only unprocessed bytes
-        buf.erase(0, pos);
+        if (!conn.readMore()) {
+            break;
+        }
     }
-    close(client_fd);
 }
 
 // =====================================================================
@@ -762,3 +632,4 @@ int main(int argc, char* argv[]) {
     expiry_thread.join();
 
     return 0;
+}

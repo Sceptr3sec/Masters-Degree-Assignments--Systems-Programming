@@ -1,11 +1,16 @@
-# Redis Client
+# Welcome to My Cpp Redis Client
+***
 
-A small C++ Redis-like client implementation that connects to a Redis server using TCP and the RESP protocol.
+## Task
+Build a Redis client that connects to a Redis server over TCP using RESP protocol for encoding and transmitting commands
 
-## Contents
+## Description
+Implemented complete RESP protocol parser and encoder, command formatting system, and interactive REPL interface for seamless Redis server communication
 
-- `main.cpp` — client executable with RESP command encoding, response parsing, and a simple REPL.
+## Installation
+make
 
-## Summary
-
-This folder contains a lightweight Redis client that can send commands to a Redis-compatible server and display responses. It supports inline command mode as well as an interactive prompt for typing Redis commands.
+## Usage
+./main
+./main GET key
+./main SET key value
